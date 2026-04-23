@@ -10,10 +10,6 @@ resources:
       name: sanjaydahiya332/azuredevopsproject
       endpoint: sanjaydahiya332
       ref: refs/heads/main
-      trigger:
-        branches:
-          include:
-            - main
 
 variables:
   - group: prod-shared-config
