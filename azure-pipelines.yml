@@ -1,79 +1,238 @@
-# Deploy to Azure Kubernetes Service
-# Build and push image to Azure Container Registry; Deploy to Azure Kubernetes Service
-# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+name: $(Date:yyyyMMdd).$(Rev:r)
 
-trigger:
-- main
+trigger: none
+pr: none
 
 resources:
-- repo: self
+  repositories:
+    - repository: appRepo
+      type: github
+      name: sanjaydahiya332/azuredevopsproject
+      endpoint: github-service-connection
+      ref: refs/heads/main
+      trigger:
+        branches:
+          include:
+            - main
 
 variables:
-
-  # Container registry service connection established during pipeline creation
-  dockerRegistryServiceConnection: 'b85cbe2f-e497-4d6b-9c63-4b010574eb3a'
-  imageRepository: 'sanjaydahiyaazuredevopsproject'
-  containerRegistry: 'azuredevopsproject.azurecr.io'
-  dockerfilePath: '**/Dockerfile'
-  tag: '$(Build.BuildId)'
-  imagePullSecret: 'azuredevopsproject8934-auth'
-
-  # Agent VM image name
-  vmImageName: 'ubuntu-latest'
-
+  - group: prod-shared-config
+  - name: appName
+    value: azuredevopsproject
+  - name: imageRepository
+    value: azuredevopsproject
+  - name: k8sDeploymentName
+    value: azuredevopsproject
 
 stages:
-- stage: Build
-  displayName: Build stage
-  jobs:
-  - job: Build
-    displayName: Build
-    pool:
-      vmImage: $(vmImageName)
-    steps:
-    - task: Docker@2
-      displayName: Build and push an image to container registry
-      inputs:
-        command: buildAndPush
-        repository: $(imageRepository)
-        dockerfile: $(dockerfilePath)
-        containerRegistry: $(dockerRegistryServiceConnection)
-        tags: |
-          $(tag)
+  - stage: ProvisionInfra
+    displayName: Provision Azure Infrastructure
+    jobs:
+      - job: TerraformApply
+        displayName: Terraform plan and apply
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: appRepo
+            fetchDepth: "0"
+            clean: "true"
 
-    - upload: manifests
-      artifact: manifests
-
-- stage: Deploy
-  displayName: Deploy stage
-  dependsOn: Build
-
-  jobs:
-  - deployment: Deploy
-    displayName: Deploy
-    pool:
-      vmImage: $(vmImageName)
-    environment: 'sanjaydahiya332azuredevopsproject.default'
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-          - task: KubernetesManifest@0
-            displayName: Create imagePullSecret
+          - task: AzureCLI@2
+            name: terraform_apply
+            displayName: Run Terraform validate, plan, and apply
             inputs:
-              action: createSecret
-              secretName: $(imagePullSecret)
-              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(Build.SourcesDirectory)/infra/terraform
+              inlineScript: |
+                set -euo pipefail
 
-          - task: KubernetesManifest@0
-            displayName: Deploy to Kubernetes cluster
+                [ -n "$(subscriptionId)" ] || { echo "Required variable 'subscriptionId' is not set."; exit 1; }
+                [ -n "$(location)" ] || { echo "Required variable 'location' is not set."; exit 1; }
+                [ -n "$(environment)" ] || { echo "Required variable 'environment' is not set."; exit 1; }
+                [ -n "$(projectName)" ] || { echo "Required variable 'projectName' is not set."; exit 1; }
+                [ -n "$(resourceGroupName)" ] || { echo "Required variable 'resourceGroupName' is not set."; exit 1; }
+                [ -n "$(acrName)" ] || { echo "Required variable 'acrName' is not set."; exit 1; }
+                [ -n "$(aksName)" ] || { echo "Required variable 'aksName' is not set."; exit 1; }
+                [ -n "$(aksKubernetesVersion)" ] || { echo "Required variable 'aksKubernetesVersion' is not set."; exit 1; }
+                [ -n "$(aksNodeCount)" ] || { echo "Required variable 'aksNodeCount' is not set."; exit 1; }
+                [ -n "$(aksNodeVmSize)" ] || { echo "Required variable 'aksNodeVmSize' is not set."; exit 1; }
+                [ -n "$(tfStateResourceGroup)" ] || { echo "Required variable 'tfStateResourceGroup' is not set."; exit 1; }
+                [ -n "$(tfStateStorageAccount)" ] || { echo "Required variable 'tfStateStorageAccount' is not set."; exit 1; }
+                [ -n "$(tfStateContainer)" ] || { echo "Required variable 'tfStateContainer' is not set."; exit 1; }
+                [ -n "$(tfStateKey)" ] || { echo "Required variable 'tfStateKey' is not set."; exit 1; }
+
+                if ! command -v terraform >/dev/null 2>&1; then
+                  echo "Installing Terraform..."
+                  curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+                  echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+                  sudo apt-get update && sudo apt-get install -y terraform
+                fi
+
+                az group create \
+                  --name "$(tfStateResourceGroup)" \
+                  --location "$(location)" \
+                  --only-show-errors >/dev/null
+
+                az storage account create \
+                  --name "$(tfStateStorageAccount)" \
+                  --resource-group "$(tfStateResourceGroup)" \
+                  --location "$(location)" \
+                  --sku Standard_LRS \
+                  --kind StorageV2 \
+                  --min-tls-version TLS1_2 \
+                  --allow-blob-public-access false \
+                  --only-show-errors >/dev/null
+
+                STORAGE_KEY="$(az storage account keys list --resource-group "$(tfStateResourceGroup)" --account-name "$(tfStateStorageAccount)" --query "[0].value" -o tsv)"
+
+                az storage container create \
+                  --name "$(tfStateContainer)" \
+                  --account-name "$(tfStateStorageAccount)" \
+                  --account-key "${STORAGE_KEY}" \
+                  --only-show-errors >/dev/null
+
+                cat > backend.hcl <<EOF
+                resource_group_name  = "$(tfStateResourceGroup)"
+                storage_account_name = "$(tfStateStorageAccount)"
+                container_name       = "$(tfStateContainer)"
+                key                  = "$(tfStateKey)"
+                access_key           = "${STORAGE_KEY}"
+                EOF
+
+                terraform version
+                terraform init -input=false -backend-config=backend.hcl
+                terraform fmt -check -recursive
+                terraform validate
+
+                terraform plan \
+                  -out=tfplan \
+                  -input=false \
+                  -var "subscription_id=$(subscriptionId)" \
+                  -var "location=$(location)" \
+                  -var "environment=$(environment)" \
+                  -var "project_name=$(projectName)" \
+                  -var "resource_group_name=$(resourceGroupName)" \
+                  -var "acr_name=$(acrName)" \
+                  -var "aks_name=$(aksName)" \
+                  -var "kubernetes_version=$(aksKubernetesVersion)" \
+                  -var "node_count=$(aksNodeCount)" \
+                  -var "node_vm_size=$(aksNodeVmSize)"
+
+                terraform apply -auto-approve tfplan
+
+                ACR_NAME="$(terraform output -raw acr_name)"
+                ACR_LOGIN_SERVER="$(terraform output -raw acr_login_server)"
+                AKS_NAME="$(terraform output -raw aks_name)"
+                RG_NAME="$(terraform output -raw resource_group_name)"
+
+                echo "##vso[task.setvariable variable=acrNameOut;isOutput=true]${ACR_NAME}"
+                echo "##vso[task.setvariable variable=acrLoginServerOut;isOutput=true]${ACR_LOGIN_SERVER}"
+                echo "##vso[task.setvariable variable=aksNameOut;isOutput=true]${AKS_NAME}"
+                echo "##vso[task.setvariable variable=resourceGroupNameOut;isOutput=true]${RG_NAME}"
+
+  - stage: BuildAndPush
+    displayName: Build and Push Container Image
+    dependsOn: ProvisionInfra
+    variables:
+      acrNameFromTf: $[ stageDependencies.ProvisionInfra.TerraformApply.outputs['terraform_apply.acrNameOut'] ]
+      acrLoginServerFromTf: $[ stageDependencies.ProvisionInfra.TerraformApply.outputs['terraform_apply.acrLoginServerOut'] ]
+    jobs:
+      - job: BuildImage
+        displayName: Build and push Docker image to ACR
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: appRepo
+            fetchDepth: "0"
+            clean: "true"
+
+          - task: AzureCLI@2
+            name: build_push
+            displayName: Build, tag, and push image
             inputs:
-              action: deploy
-              manifests: |
-                $(Pipeline.Workspace)/manifests/deployment.yml
-                $(Pipeline.Workspace)/manifests/service.yml
-              imagePullSecrets: |
-                $(imagePullSecret)
-              containers: |
-                $(containerRegistry)/$(imageRepository):$(tag)
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(Build.SourcesDirectory)
+              inlineScript: |
+                set -euo pipefail
 
+                if [ -z "$(acrNameFromTf)" ] || [ -z "$(acrLoginServerFromTf)" ]; then
+                  echo "Missing ACR outputs from Terraform stage."
+                  exit 1
+                fi
+
+                COMMIT_SHA="$(git rev-parse --short=8 HEAD)"
+                IMAGE_TAG="$(Build.BuildId)-${COMMIT_SHA}"
+                IMAGE_URI="$(acrLoginServerFromTf)/$(imageRepository):${IMAGE_TAG}"
+
+                az acr login --name "$(acrNameFromTf)"
+
+                [ -f "Dockerfile" ] || { echo "Dockerfile not found at repository root."; exit 1; }
+
+                docker build --pull -t "${IMAGE_URI}" .
+                docker push "${IMAGE_URI}"
+
+                echo "##vso[task.setvariable variable=imageTagOut;isOutput=true]${IMAGE_TAG}"
+                echo "##vso[task.setvariable variable=imageUriOut;isOutput=true]${IMAGE_URI}"
+
+  - stage: SecurityScan
+    displayName: Security and Image Scan
+    dependsOn:
+      - BuildAndPush
+    variables:
+      imageUriFromBuild: $[ stageDependencies.BuildAndPush.BuildImage.outputs['build_push.imageUriOut'] ]
+    jobs:
+      - job: ScanImage
+        displayName: Run Trivy scan on pushed image
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: Bash@3
+            displayName: Install Trivy and scan image
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                if [ -z "$(imageUriFromBuild)" ]; then
+                  echo "Missing image URI from build stage."
+                  exit 1
+                fi
+
+                sudo apt-get update
+                sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+                wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+                echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+                sudo apt-get update
+                sudo apt-get install -y trivy
+
+                trivy image \
+                  --severity HIGH,CRITICAL \
+                  --ignore-unfixed \
+                  --exit-code 1 \
+                  "$(imageUriFromBuild)"
+
+  - template: pipelines/templates/stages/deploy-aks-stage.yml
+    parameters:
+      stageName: DeployDev
+      displayName: Deploy to AKS Dev
+      environmentName: dev
+      namespace: dev
+      dependsOn:
+        - ProvisionInfra
+        - BuildAndPush
+        - SecurityScan
+
+  - template: pipelines/templates/stages/deploy-aks-stage.yml
+    parameters:
+      stageName: DeployProd
+      displayName: Deploy to AKS Prod
+      environmentName: production
+      namespace: production
+      dependsOn:
+        - DeployDev

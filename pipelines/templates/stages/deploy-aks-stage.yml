@@ -1,0 +1,81 @@
+parameters:
+  - name: stageName
+    type: string
+  - name: displayName
+    type: string
+  - name: environmentName
+    type: string
+  - name: namespace
+    type: string
+  - name: dependsOn
+    type: object
+    default: []
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    variables:
+      imageUriFromBuild: $[ stageDependencies.BuildAndPush.BuildImage.outputs['build_push.imageUriOut'] ]
+      aksNameFromTf: $[ stageDependencies.ProvisionInfra.TerraformApply.outputs['terraform_apply.aksNameOut'] ]
+      resourceGroupFromTf: $[ stageDependencies.ProvisionInfra.TerraformApply.outputs['terraform_apply.resourceGroupNameOut'] ]
+    jobs:
+      - deployment: Deploy
+        displayName: Deploy to ${{ parameters.environmentName }}
+        environment: ${{ parameters.environmentName }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: appRepo
+                  fetchDepth: "0"
+                  clean: "true"
+
+                - task: AzureKeyVault@2
+                  displayName: Fetch deployment secrets from Key Vault
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    KeyVaultName: $(keyVaultName)
+                    SecretsFilter: appSecret
+                    RunAsPreJob: false
+
+                - task: AzureCLI@2
+                  displayName: Configure kubectl and deploy manifests
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    workingDirectory: $(Build.SourcesDirectory)
+                    inlineScript: |
+                      set -euo pipefail
+
+                      if [ -z "$(resourceGroupFromTf)" ] || [ -z "$(aksNameFromTf)" ] || [ -z "$(imageUriFromBuild)" ]; then
+                        echo "Missing required deployment inputs from previous stages."
+                        exit 1
+                      fi
+
+                      if ! command -v kubectl >/dev/null 2>&1; then
+                        az aks install-cli
+                      fi
+
+                      az aks get-credentials \
+                        --resource-group "$(resourceGroupFromTf)" \
+                        --name "$(aksNameFromTf)" \
+                        --overwrite-existing
+
+                      kubectl create namespace "${{ parameters.namespace }}" --dry-run=client -o yaml | kubectl apply -f -
+
+                      kubectl create secret generic app-secrets \
+                        --namespace "${{ parameters.namespace }}" \
+                        --from-literal=APP_SECRET="$(appSecret)" \
+                        --dry-run=client -o yaml | kubectl apply -f -
+
+                      sed "s|__IMAGE__|$(imageUriFromBuild)|g; s|__NAMESPACE__|${{ parameters.namespace }}|g; s|__APP_NAME__|$(k8sDeploymentName)|g" k8s/deployment.yaml > k8s/deployment.rendered.yaml
+                      sed "s|__NAMESPACE__|${{ parameters.namespace }}|g; s|__APP_NAME__|$(k8sDeploymentName)|g" k8s/service.yaml > k8s/service.rendered.yaml
+
+                      kubectl apply -f k8s/deployment.rendered.yaml
+                      kubectl apply -f k8s/service.rendered.yaml
+
+                      kubectl rollout status deployment/$(k8sDeploymentName) -n "${{ parameters.namespace }}" --timeout=300s
+                      kubectl get svc $(k8sDeploymentName)-svc -n "${{ parameters.namespace }}"
