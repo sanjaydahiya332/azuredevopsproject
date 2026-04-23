@@ -1,0 +1,19 @@
+apiVersion : apps/v1
+kind: Deployment
+metadata:
+  name: sanjaydahiyaazuredevopsproject 
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sanjaydahiyaazuredevopsproject
+  template:
+    metadata:
+      labels:
+        app: sanjaydahiyaazuredevopsproject 
+    spec:
+      containers:
+        - name: sanjaydahiyaazuredevopsproject 
+          image: azuredevopsproject.azurecr.io/sanjaydahiyaazuredevopsproject
+          ports:
+          - containerPort: 80
