@@ -8,7 +8,7 @@ resources:
     - repository: appRepo
       type: github
       name: sanjaydahiya332/azuredevopsproject
-      endpoint: github-service-connection
+      endpoint: sanjaydahiya332
       ref: refs/heads/main
       trigger:
         branches:
